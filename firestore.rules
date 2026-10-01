@@ -1,0 +1,340 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isManagerFor(buildingId) {
+      return signedIn()
+        && profile().buildingId == buildingId
+        && profile().role in ['manager', 'admin'];
+    }
+
+    function invitation(code) {
+      return get(/databases/$(database)/documents/buildingInvitations/$(code)).data;
+    }
+
+    function claimedInvitation(code) {
+      return getAfter(/databases/$(database)/documents/buildingInvitations/$(code)).data;
+    }
+
+    function invitationAfterClaim(code, email, userId) {
+      let claimed = claimedInvitation(code);
+      return claimed.used == true
+        && claimed.usedBy == userId
+        && claimed.email == email;
+    }
+
+    function jobAssignedTo(requestId, technicianId, buildingId) {
+      let job = getAfter(/databases/$(database)/documents/maintenanceRequests/$(requestId)).data;
+      let technician = get(/databases/$(database)/documents/users/$(technicianId)).data;
+      return job.assignedTechnicianId == technicianId
+        && job.buildingId == buildingId
+        && job.status == 'assigned'
+        && job.category in technician.skillCategories;
+    }
+
+    function jobAcceptedBy(requestId, technicianId, buildingId) {
+      let job = getAfter(/databases/$(database)/documents/maintenanceRequests/$(requestId)).data;
+      return job.assignedTechnicianId == technicianId
+        && job.buildingId == buildingId
+        && job.status == 'accepted';
+    }
+
+    function jobMovedFrom(requestId, technicianId, buildingId) {
+      let job = getAfter(/databases/$(database)/documents/maintenanceRequests/$(requestId)).data;
+      return job.assignedTechnicianId != technicianId
+        && job.buildingId == buildingId
+        && job.status == 'assigned';
+    }
+
+    function jobCompletedBy(requestId, technicianId, buildingId) {
+      let job = getAfter(/databases/$(database)/documents/maintenanceRequests/$(requestId)).data;
+      return job.assignedTechnicianId == technicianId
+        && job.buildingId == buildingId
+        && job.status == 'completed';
+    }
+
+    function technicianMatches(buildingId, category, technicianId) {
+      let technician = get(/databases/$(database)/documents/users/$(technicianId)).data;
+      return technician.role == 'technician'
+        && technician.buildingId == buildingId
+        && technician.isAvailable != false
+        && category in technician.skillCategories;
+    }
+
+    match /users/{userId} {
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.role == 'resident'
+        && request.resource.data.membershipStatus == 'pending_verification'
+        && request.resource.data.inviteCode is string
+        && request.resource.data.email == request.auth.token.email
+        && request.auth.token.email_verified == false
+        && invitation(request.resource.data.inviteCode).email == request.resource.data.email
+        && invitation(request.resource.data.inviteCode).role in ['resident', 'technician']
+        && invitation(request.resource.data.inviteCode).used == false
+        && invitation(request.resource.data.inviteCode).expiresAt > request.time.toMillis();
+
+      allow get, list: if signedIn() && (
+        request.auth.uid == userId
+        || (profile().buildingId != null
+          && resource.data.buildingId == profile().buildingId
+          && resource.data.role in ['manager', 'admin', 'technician'])
+        || (isManagerFor(profile().buildingId)
+          && resource.data.buildingId == profile().buildingId)
+      );
+
+      allow update: if signedIn() && (
+        (request.auth.uid == userId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'phone']))
+        || (request.auth.uid == userId
+          && request.auth.token.email_verified == true
+          && resource.data.role == 'resident'
+          && resource.data.membershipStatus == 'pending_verification'
+          && request.resource.data.membershipStatus == 'active'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'membershipStatus', 'buildingId', 'buildingName', 'buildingLatitude', 'buildingLongitude', 'unitNumber', 'skillCategories', 'isAvailable', 'activeRequestId', 'openJobs', 'inviteCode'])
+          && invitationAfterClaim(resource.data.inviteCode, resource.data.email, userId)
+          && request.resource.data.role == claimedInvitation(resource.data.inviteCode).role
+          && request.resource.data.buildingId == claimedInvitation(resource.data.inviteCode).buildingId
+          && request.resource.data.buildingName == claimedInvitation(resource.data.inviteCode).buildingName
+          && request.resource.data.buildingLatitude == claimedInvitation(resource.data.inviteCode).buildingLatitude
+          && request.resource.data.buildingLongitude == claimedInvitation(resource.data.inviteCode).buildingLongitude
+          && request.resource.data.unitNumber == claimedInvitation(resource.data.inviteCode).unitNumber
+          && request.resource.data.skillCategories == claimedInvitation(resource.data.inviteCode).skillCategories
+          && request.resource.data.isAvailable == (claimedInvitation(resource.data.inviteCode).role == 'technician')
+          && request.resource.data.activeRequestId == null
+          && request.resource.data.openJobs == 0
+          && request.resource.data.inviteCode == null
+        )
+      );
+
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && isManagerFor(resource.data.buildingId)
+        && resource.data.role == 'manager'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['buildingLatitude', 'buildingLongitude'])
+        && request.resource.data.buildingLatitude is number
+        && request.resource.data.buildingLatitude >= -90
+        && request.resource.data.buildingLatitude <= 90
+        && request.resource.data.buildingLongitude is number
+        && request.resource.data.buildingLongitude >= -180
+        && request.resource.data.buildingLongitude <= 180;
+
+      allow update: if signedIn()
+        && isManagerFor(resource.data.buildingId)
+        && resource.data.role == 'technician'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['activeRequestId', 'openJobs'])
+        && ((request.resource.data.activeRequestId is string
+            && request.resource.data.openJobs == 1
+            && resource.data.isAvailable == true
+            && resource.data.get('activeRequestId', null) == null
+            && jobAssignedTo(request.resource.data.activeRequestId, userId, resource.data.buildingId))
+          || (request.resource.data.activeRequestId == null
+            && request.resource.data.openJobs == 0
+            && resource.data.activeRequestId is string
+            && jobMovedFrom(resource.data.activeRequestId, userId, resource.data.buildingId)));
+
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && resource.data.role == 'technician'
+        && resource.data.membershipStatus == 'active'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isAvailable'])
+        && request.resource.data.isAvailable is bool;
+
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && resource.data.role == 'technician'
+        && resource.data.isAvailable == true
+        && resource.data.get('activeRequestId', null) == null
+        && request.resource.data.activeRequestId is string
+        && request.resource.data.openJobs == 1
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['activeRequestId', 'openJobs'])
+        && jobAcceptedBy(request.resource.data.activeRequestId, userId, resource.data.buildingId);
+
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && resource.data.role == 'technician'
+        && resource.data.activeRequestId is string
+        && request.resource.data.activeRequestId == null
+        && request.resource.data.openJobs == 0
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['activeRequestId', 'openJobs'])
+        && jobCompletedBy(resource.data.activeRequestId, userId, resource.data.buildingId);
+
+      allow update: if signedIn()
+        && profile().role == 'resident'
+        && profile().membershipStatus == 'active'
+        && profile().buildingId == resource.data.buildingId
+        && resource.data.role == 'technician'
+        && resource.data.isAvailable == true
+        && resource.data.get('activeRequestId', null) == null
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['activeRequestId', 'openJobs'])
+        && request.resource.data.activeRequestId is string
+        && request.resource.data.openJobs == 1
+        && jobAssignedTo(request.resource.data.activeRequestId, userId, resource.data.buildingId);
+
+      allow delete: if false;
+    }
+
+    match /buildingInvitations/{inviteCode} {
+      allow get: if resource.data.used == false
+        && resource.data.expiresAt > request.time.toMillis()
+        && (!signedIn()
+          || request.auth.token.email == resource.data.email
+          || isManagerFor(resource.data.buildingId));
+      allow list: if false;
+
+      allow create: if isManagerFor(request.resource.data.buildingId)
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.used == false
+        && request.resource.data.email is string
+        && request.resource.data.role in ['resident', 'technician']
+        && request.resource.data.unitNumber is string
+        && request.resource.data.skillCategories is list
+        && (request.resource.data.buildingLatitude == null || request.resource.data.buildingLatitude is number)
+        && (request.resource.data.buildingLongitude == null || request.resource.data.buildingLongitude is number)
+        && ((request.resource.data.role == 'resident'
+            && request.resource.data.unitNumber.size() > 0
+            && request.resource.data.skillCategories.size() == 0)
+          || (request.resource.data.role == 'technician'
+            && request.resource.data.unitNumber == ''
+            && request.resource.data.skillCategories.size() > 0))
+        && request.resource.data.expiresAt > request.time.toMillis()
+        && request.resource.data.expiresAt <= request.time.toMillis() + 7 * 24 * 60 * 60 * 1000;
+
+      allow update: if signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == resource.data.email
+        && resource.data.used == false
+        && resource.data.expiresAt > request.time.toMillis()
+        && request.resource.data.used == true
+        && request.resource.data.usedBy == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['used', 'usedBy', 'usedAt']);
+      allow delete: if false;
+    }
+
+    match /maintenanceRequests/{requestId} {
+      allow create: if signedIn()
+        && profile().role == 'resident'
+        && profile().membershipStatus == 'active'
+        && request.resource.data.residentId == request.auth.uid
+        && request.resource.data.buildingId == profile().buildingId
+        && request.resource.data.status in ['offered', 'unassigned']
+        && request.resource.data.assignedTechnicianId == null
+        && request.resource.data.assignedTechnicianName == null
+        && request.resource.data.offeredTechnicianIds is list
+        && ((request.resource.data.status == 'offered' && request.resource.data.offeredTechnicianIds.size() > 0)
+          || (request.resource.data.status == 'unassigned' && request.resource.data.offeredTechnicianIds.size() == 0));
+
+      allow get, list: if signedIn() && (
+        (profile().role == 'resident' && resource.data.residentId == request.auth.uid)
+        || (profile().role == 'technician'
+          && profile().buildingId == resource.data.buildingId
+          && (resource.data.assignedTechnicianId == request.auth.uid
+            || (resource.data.offeredTechnicianIds is list
+              && request.auth.uid in resource.data.offeredTechnicianIds)))
+        || isManagerFor(resource.data.buildingId)
+      );
+
+      allow update: if signedIn() && (
+        isManagerFor(resource.data.buildingId)
+        || (profile().role == 'technician'
+          && resource.data.status == 'offered'
+          && resource.data.get('offeredTechnicianIds', []).hasAny([request.auth.uid])
+          && profile().buildingId == resource.data.buildingId
+          && profile().isAvailable == true
+          && profile().get('activeRequestId', null) == null
+          && resource.data.category in profile().skillCategories
+          && request.resource.data.status == 'accepted'
+          && request.resource.data.assignedTechnicianId == request.auth.uid
+          && request.resource.data.assignedTechnicianName is string
+          && request.resource.data.offeredTechnicianIds == []
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'assignedTechnicianId', 'assignedTechnicianName', 'offeredTechnicianIds', 'updatedAt']))
+        || (profile().role == 'technician'
+          && profile().buildingId == resource.data.buildingId
+          && resource.data.status == 'offered'
+          && resource.data.offeredTechnicianIds.hasAny([request.auth.uid])
+          && request.resource.data.offeredTechnicianIds is list
+          && resource.data.offeredTechnicianIds.hasAll(request.resource.data.offeredTechnicianIds)
+          && request.resource.data.offeredTechnicianIds.size() == resource.data.offeredTechnicianIds.size() - 1
+          && !request.resource.data.offeredTechnicianIds.hasAny([request.auth.uid])
+          && request.resource.data.assignedTechnicianId == null
+          && request.resource.data.assignedTechnicianName == null
+          && ((request.resource.data.offeredTechnicianIds.size() > 0
+              && request.resource.data.status == 'offered'
+              && request.resource.data.managerEscalationAt == resource.data.managerEscalationAt
+              && request.resource.data.managerEscalated == resource.data.managerEscalated)
+            || (request.resource.data.offeredTechnicianIds.size() == 0
+              && request.resource.data.status == 'unassigned'
+              && request.resource.data.managerEscalationAt == null
+              && request.resource.data.managerEscalated == true))
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'offeredTechnicianIds', 'managerEscalationAt', 'managerEscalated', 'updatedAt']))
+        || (profile().role == 'technician'
+          && resource.data.assignedTechnicianId == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && ((resource.data.status == 'assigned' && request.resource.data.status == 'accepted')
+            || (resource.data.status == 'accepted' && request.resource.data.status == 'en_route')
+            || (resource.data.status == 'en_route' && request.resource.data.status == 'arrived')
+            || (resource.data.status == 'arrived' && request.resource.data.status == 'in_progress')
+            || (resource.data.status == 'in_progress' && request.resource.data.status == 'completed')))
+        || (profile().role == 'technician'
+          && resource.data.assignedTechnicianId == request.auth.uid
+          && resource.data.status == 'en_route'
+          && request.resource.data.status == 'en_route'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['technicianLocation', 'technicianLocationUpdatedAt', 'updatedAt'])
+          && request.resource.data.technicianLocation.latitude is number
+          && request.resource.data.technicianLocation.longitude is number)
+        || (profile().role == 'resident'
+          && resource.data.residentId == request.auth.uid
+          && resource.data.status == 'completed'
+          && request.resource.data.status == 'closed'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']))
+        || (profile().role == 'resident'
+          && resource.data.residentId == request.auth.uid
+          && resource.data.status in ['completed', 'closed']
+          && request.resource.data.status == 'unassigned'
+          && request.resource.data.assignedTechnicianId == null
+          && request.resource.data.assignedTechnicianName == null
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'assignedTechnicianId', 'assignedTechnicianName', 'updatedAt']))
+        || (profile().role == 'resident'
+          && resource.data.residentId == request.auth.uid
+          && resource.data.status in ['completed', 'closed']
+          && request.resource.data.status == resource.data.status
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['residentRating', 'residentReview', 'reviewedAt', 'complaintDescription', 'complaintStatus', 'complaintCreatedAt', 'updatedAt'])
+          && (!('residentRating' in request.resource.data)
+            || (request.resource.data.residentRating is int
+              && request.resource.data.residentRating >= 1
+              && request.resource.data.residentRating <= 5))
+          && (!('residentReview' in request.resource.data)
+            || (request.resource.data.residentReview is string
+              && request.resource.data.residentReview.size() <= 1000))
+          && (!('complaintDescription' in request.resource.data)
+            || (request.resource.data.complaintDescription is string
+              && request.resource.data.complaintDescription.size() > 0
+              && request.resource.data.complaintDescription.size() <= 2000
+              && request.resource.data.complaintStatus == 'open')))
+      );
+
+      allow delete: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow get, list, update: if signedIn() && resource.data.userId == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.userId is string
+        && get(/databases/$(database)/documents/users/$(request.resource.data.userId)).data.buildingId
+          == profile().buildingId
+        && profile().buildingId != null;
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
